@@ -1,0 +1,7 @@
+versionStoreType: JDBC
+jdbc:
+  jdbcUrl: jdbc:postgresql://postgres:5432/nessiedb
+  secret:
+    name: postgres-creds
+    username: postgres_username
+    password: postgres_password

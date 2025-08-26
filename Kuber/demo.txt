@@ -1,0 +1,149 @@
+# Демонстрация Spark c MinIO и Iceberg в Kubernetes
+
+## Запускаем MinIO и создаём бакет warehouse
+MINIO_ROOT_USER=admin MINIO_ROOT_PASSWORD=password minio server $PWD/minio/data --console-address ":9001"
+mc alias set minio http://127.0.0.1:9000 admin password
+mc mb minio/warehouse --ignore-existing
+mc mb minio/tmp --ignore-existing
+mc policy set public minio/warehouse
+mc policy set public minio/tmp
+
+## Запускаем и настраиваем Kubernetes
+### Запускаем Minikube
+minikube start --cpus='max' --memory='no-limit'
+kubectl cluster-info
+export KCP=$(kubectl config view -o jsonpath="{.clusters[].cluster.server}")
+
+### Создаём пространство имён для Nessie
+kubectl create namespace nessie-ns
+
+### Запускаем PostgreSQL
+kubectl apply -f postgres/postgres-secret.yaml -n nessie-ns
+kubectl apply -f postgres/postgres-configmap.yaml -n nessie-ns
+kubectl apply -f postgres/postgres-storage.yaml -n nessie-ns
+kubectl apply -f postgres/postgres-deployment.yaml -n nessie-ns
+kubectl apply -f postgres/postgres-service.yaml -n nessie-ns
+export PGPOD=$(kubectl get pods -l app==postgres -n nessie-ns --output name)
+
+### Подключаемся к PostgreSQL для проверки
+kubectl exec -it $PGPOD -n nessie-ns --  psql -h localhost -U postgres -W nessiedb
+\dn
+\dt
+\q
+
+### Запускаем Nessie
+kubectl create secret generic postgres-creds --from-env-file="nessie/postgres-creds" -n nessie-ns
+helm repo add nessie-helm https://charts.projectnessie.org
+helm repo update
+helm install -n nessie-ns nessie nessie-helm/nessie -f nessie/values.yaml
+export NPOD=$(kubectl get pods -l app.kubernetes.io/name=nessie -n nessie-ns --output name)
+export NIP=$(kubectl get service/nessie -n nessie-ns -o=jsonpath='{.spec.clusterIP}')
+
+kubectl create clusterrolebinding nessie-role --clusterrole=edit --serviceaccount=nessie-ns:nessie --namespace=nessie-ns
+
+### Включаем проброс порта Nessie для подключения с хоста
+kubectl port-forward --address 127.0.0.1,192.168.88.20 -n nessie-ns $NPOD 19120:19120
+
+### Подключаемся Nessie CLI
+/opt/nessie/bin/nessie-cli.sh
+CONNECT TO http://192.168.88.20:19120/api/v2
+LIST REFERENCES
+LIST CONTENTS
+EXIT
+
+### Создаём пространство имён и account для Spark
+#kubectl create namespace spark
+#kubectl create serviceaccount spark --namespace=spark
+#kubectl create clusterrolebinding spark-role --clusterrole=edit --serviceaccount=spark:spark --namespace=spark
+
+### Запускаем задания Spark
+/opt/spark/bin/spark-shell \
+  --master k8s://$KCP \
+  --deploy-mode client \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=nessie-ns \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=nessie \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=admin \
+  --conf spark.hadoop.fs.s3a.secret.key=password \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.nessie.type=nessie \
+  --conf spark.sql.catalog.nessie.default-namespace=warehouse \
+  --conf spark.sql.catalog.nessie.uri=http://127.0.0.1:19120/api/v1 \
+  --conf spark.sql.catalog.nessie.warehouse=s3a://warehouse < spark/script2.sc
+
+#### Test S3
+time /opt/spark/bin/spark-submit \
+  --master k8s://$KCP \
+  --deploy-mode cluster \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=nessie-ns \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=nessie \
+  --conf spark.kubernetes.file.upload.path=s3a://tmp \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=admin \
+  --conf spark.hadoop.fs.s3a.secret.key=password \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp -Divy.home=/tmp" \
+  spark/NYCTaxiTest.jar s3 s3a://warehouse/nyctaxi
+
+real    6m34,603s
+user    0m15,815s
+sys     0m1,038s
+
+#### Test Iceberg
+time /opt/spark/bin/spark-submit \
+  --master k8s://$KCP \
+  --deploy-mode cluster \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=nessie-ns \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=nessie \
+  --conf spark.kubernetes.file.upload.path=s3a://tmp \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=admin \
+  --conf spark.hadoop.fs.s3a.secret.key=password \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp -Divy.home=/tmp" \
+  --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.nessie.type=nessie \
+  --conf spark.sql.catalog.nessie.uri=http://$NIP:19120/api/v1 \
+  --conf spark.sql.catalog.nessie.warehouse=s3a://warehouse \
+  spark/NYCTaxiTest.jar iceberg s3a://warehouse/nyctaxi
+
+real    6m41,173s
+user    0m17,206s
+sys     0m1,071s
+
+### Подключаемся у Nessie для проверки
+/opt/nessie/bin/nessie-cli.sh
+CONNECT TO http://192.168.88.20:19120/api/v2
+LIST REFERENCES
+LIST CONTENTS
+show table monthlyB

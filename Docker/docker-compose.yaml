@@ -1,0 +1,125 @@
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+    container_name: minio
+    hostname: minio
+    ports:
+      - "9000:9000" # API port
+      - "9090:9090" # MinIO UI
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_ADDRESS=:9000
+      - MINIO_CONSOLE_ADDRESS=:9090
+    volumes:
+      - ./minio/data:/data
+    command: server /data
+    healthcheck:
+      test: "bash -c '[[ \"$(exec 3<>/dev/tcp/localhost/9000 && echo -e '\"'\"'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'\"'\"' >&3 && cat <&3 | head -n 1)\" == *\"200 OK\"* ]] || exit 1'"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  minio-setup:
+    depends_on:
+      minio:
+        condition: service_healthy
+    image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+    container_name: minio-setup
+    entrypoint: /bin/bash
+    restart: "no"
+    command: [
+      "-c",
+      "mc alias set minio http://minio:9000/ admin password; mc mb minio/warehouse --ignore-existing; mc policy set public minio/warehouse"
+      ]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.104.2
+    container_name: nessie
+    hostname: nessie
+    ports:
+      - "19120:19120" # API port
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./nessie/config:/deployments/config
+    healthcheck:
+      test: "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /q/health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  postgres:
+    image: postgres:17.5
+    container_name: postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    # set shared memory limit when using docker-compose
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nessiedb
+      POSTGRES_INITDB_ARGS: "--encoding UTF8 --data-checksums"
+    volumes:
+      - ./postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: "pg_isready -U postgres"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  master:
+    image: apache/spark:3.5.6
+    container_name: master
+    hostname: master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "15002:15002"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/master:/home/spark
+
+  slave1:
+    image: apache/spark:3.5.6
+    container_name: slave1
+    hostname: slave1
+    environment:
+      - SPARK_MASTER_HOST=master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://master:7077
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/slave1:/home/spark
+
+  slave2:
+    image: apache/spark:3.5.6
+    container_name: slave2
+    hostname: slave1
+    environment:
+      - SPARK_MASTER_HOST=master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://master:7077
+    ports:
+      - "8082:8081"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/slave2:/home/spark
+
+  slave3:
+    image: apache/spark:3.5.6
+    container_name: slave3
+    hostname: slave1
+    environment:
+      - SPARK_MASTER_HOST=master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://master:7077
+    ports:
+      - "8083:8081"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/slave3:/home/spark
+

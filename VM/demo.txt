@@ -1,0 +1,315 @@
+# Запуск заданий Spark в Kubernetes с сохранением в MinIO (S3) в формате Iceberg с каталогом Nessie
+
+## Обновление ОС (Rocky 9)
+sudo dnf update
+sudo dnf clean all
+sudo dnf --enablerepo=* clean all
+
+##№ Выключаем SELinux и Firewall
+sudo grubby --update-kernel ALL --args selinux=0
+sudo systemctl stop firewalld.service
+sudo systemctl disable firewalld.service
+sudo reboot
+
+### Добавляем имена хостов для сервисов
+sudo cat >> /etc/hosts << EOF
+127.0.0.1  postgres
+192.168.49.1  minio
+192.168.49.1  nessie
+192.168.49.1 host.minikube.internal
+EOF
+
+
+## Установка PostgreSQL
+### Install the repository RPM:
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+### Disable the built-in PostgreSQL module:
+sudo dnf -qy module disable postgresql
+
+### Install PostgreSQL:
+sudo dnf install -y postgresql17-server
+
+### Initialize the database and enable automatic start:
+sudo /usr/pgsql-17/bin/postgresql-17-setup initdb
+sudo systemctl enable postgresql-17
+sudo systemctl start postgresql-17
+
+### Подготавливаем PostgreSQL для Nessie
+su -l postgres
+psql
+CREATE ROLE nessie WITH LOGIN PASSWORD 'changeme';
+CREATE DATABASE nessiedb OWNER nessie;
+\c nessiedb
+CREATE SCHEMA nessie AUTHORIZATION nessie;
+\q
+exit
+
+
+## Установка MinIO
+sudo dnf install https://dl.min.io/server/minio/release/linux-amd64/minio-20250524170830.0.0-1.x86_64.rpm
+wget https://dl.min.io/client/mc/release/linux-amd64/mc
+sudo mv mc /usr/local/bin
+sudo chmod +x /usr/local/bin/mc
+sudo groupadd minio-user
+sudo useradd -M -r -g minio-user minio-user
+sudo mkdir /data
+sudo chown minio-user:minio-user /data
+sudo cat > /etc/default/minio << EOF
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=changeme
+MINIO_VOLUMES="/data"
+MINIO_OPTS="--console-address :9001"
+EOF
+
+### Запускаем MinIO
+sudo systemctl enable minio.service
+sudo systemctl start minio.service
+
+### Создаём алиас для управления
+mc alias set minio http://localhost:9000 minioadmin changeme
+
+### Создаём пользователя для Iceberg и Nessie
+mc admin user add minio iceberg changeme
+mc admin user add minio nessie changeme
+
+### Создаём бакет для Iceberg
+mc mb minio/warehouse --ignore-existing
+mc admin policy attach minio readwrite -u iceberg
+mc admin policy attach minio readwrite -u nessie
+
+
+## Установка JDK
+sudo dnf install java-21-openjdk
+
+
+## Установка Nessie
+sudo groupadd nessie
+sudo useradd -d /opt/nessie -m -r -g nessie nessie
+su -l nessie
+mkdir bin
+mkdir config
+mkdir jars
+
+### Nessie Server
+curl -L -o jars/nessie-quarkus-0.104.2-runner.jar https://github.com/projectnessie/nessie/releases/download/nessie-0.104.2/nessie-quarkus-0.104.2-runner.jar
+
+cat > config/application.properties << EOF 
+quarkus.management.port=9009
+nessie.catalog.default-warehouse=warehouse
+nessie.catalog.warehouses.warehouse.location=http://minio:9000/warehouse
+nessie.catalog.service.s3.default-options.endpoint=http://minio:9000/
+nessie.catalog.service.s3.default-options.path-style-access=true
+nessie.catalog.service.s3.default-options.access-key=my-secrets.s3-bucket
+my-secrets.s3-bucket.name=nessie
+my-secrets.s3-bucket.secret=changeme
+nessie.version.store.type=JDBC2
+nessie.version.store.persist.jdbc.datasource=postgresql
+quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://postgres:5432/nessiedb
+quarkus.datasource.postgresql.username=nessie
+quarkus.datasource.postgresql.password=changeme
+EOF
+
+sudo cat > /usr/lib/systemd/system/nessie.service << EOF
+[Unit]
+Description=Nessie
+Documentation=https://projectnessie.org/nessie-0-104-2/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+
+WorkingDirectory=/opt/nessie
+
+User=nessie      
+Group=nessie
+
+ExecStart=/usr/bin/java -jar jars/nessie-quarkus-0.104.2-runner.jar 
+
+# Let systemd restart this service always
+Restart=always
+ 
+# Disable killing of MinIO by the kernel's OOM killer
+OOMScoreAdjust=-1000
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable nessie
+sudo systemctl start nessie
+
+### Nessie Server Admin Tool
+curl -L -o jars/nessie-server-admin-tool-0.104.2-runner.jar https://github.com/projectnessie/nessie/releases/download/nessie-0.104.2/nessie-server-admin-tool-0.104.2-runner.jar
+ln -s $PWD/jars/nessie-server-admin-tool-0.104.2-runner.jar $PWD/jars/nessie-server-admin-tool.jar
+
+cat > bin/nessie-admin.sh << EOF
+#!/bin/bash
+
+/usr/bin/java -jar /opt/nessie/jars/nessie-server-admin-tool.jar \$1
+EOF
+chmod +x bin/nessie-admin.sh
+
+bin/nessie-admin.sh info
+
+### Nessie CLI & REPL
+curl -L -o jars/nessie-cli-0.104.2.jar https://github.com/projectnessie/nessie/releases/download/nessie-0.104.2/nessie-cli-0.104.2.jar
+ln -s $PWD/jars/nessie-cli-0.104.2.jar $PWD/jars/nessie-cli.jar
+
+cat > bin/nessie-cli.sh << EOF
+#!/bin/bash
+
+/usr/bin/java -jar /opt/nessie/jars/nessie-cli.jar
+EOF
+chmod +x bin/nessie-cli.sh
+
+bin/nessie-cli.sh
+CONNECT TO http://127.0.0.1:19120/iceberg/
+list REFERENCES
+exit
+
+### Nessie GC Tool
+curl -L -o jars/nessie-gc-0.104.2.jar https://github.com/projectnessie/nessie/releases/download/nessie-0.104.2/nessie-gc-0.104.2.jar
+ln -s $PWD/jars/nessie-gc-0.104.2.jar $PWD/jars/nessie-gc.jar
+java -jar nessie-gc.jar create-sql-schema \
+  --jdbc-url jdbc:postgresql://postgres:5432/nessiedb \
+  --jdbc-user nessie \
+  --jdbc-password changeme
+
+cat > bin/nessie-gc.sh << EOF
+#!/bin/bash
+
+/usr/bin/java -jar /opt/nessie/jars/nessie-gc.jar list --jdbc --jdbc-url=jdbc:postgresql://127.0.0.1:5432/nessiedb --jdbc-user nessie --jdbc-password changeme
+EOF
+chmod +x bin/nessie-gc.sh
+
+
+## Установка Docker Engine
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+
+## Установка Minikube
+### Установка kubectl
+curl -LO https://dl.k8s.io/release/`curl -LS https://dl.k8s.io/release/stable.txt`/bin/linux/amd64/kubectl
+sudo mv kubectl /usr/local/bin
+sudo chmod +x /usr/local/bin/kubectl
+kubectl version --client
+
+### Установка Minikube
+curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo mv minikube /usr/local/bin/minikube
+sudo chmod +x /usr/local/bin/minikube
+
+### Запуск Minikube 
+minikube start --cpus='max' --memory='no-limit'
+kubectl cluster-info
+export KCP=$(kubectl config view -o jsonpath="{.clusters[].cluster.server}")
+
+
+## Установка Spark локально для запуска заданий
+cd /tmp
+wget https://dlcdn.apache.org/spark/spark-3.5.6/spark-3.5.6-bin-hadoop3.tgz
+cd /opt
+sudo tar xvf /tmp/spark-3.5.6-bin-hadoop3.tgz
+sudo ln -s /opt/spark-3.5.6-bin-hadoop3 /opt/spark
+export SPARK_HOME=/opt/spark
+
+### Создаём пространство имён и account для Spark
+kubectl create namespace spark
+kubectl create serviceaccount spark --namespace=spark
+kubectl create clusterrolebinding spark-role --clusterrole=edit --serviceaccount=spark:spark --namespace=spark
+
+### Запускаем скрипт Spark
+/opt/spark/bin/spark-shell \
+  --master k8s://$KCP \
+  --deploy-mode client \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=spark \
+  --conf spark.kubernetes.driver.annotation.sidecar.istio.io/inject=false \
+  --conf spark.kubernetes.executor.annotation.sidecar.istio.io/inject=false \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=iceberg \
+  --conf spark.hadoop.fs.s3a.secret.key=changeme \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.nessie.type=nessie \
+  --conf spark.sql.catalog.nessie.default-namespace=warehouse \
+  --conf spark.sql.catalog.nessie.uri=http://192.168.49.1:19120/api/v1 \
+  --conf spark.sql.catalog.nessie.warehouse=s3a://warehouse < script2.sc
+
+### Запускаем задание Spark по работе с Iceberg
+/opt/spark/bin/spark-submit \
+  --master k8s://$KCP \
+  --deploy-mode cluster \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=spark \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+  --conf spark.kubernetes.file.upload.path=s3a://tmp \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=iceberg \
+  --conf spark.hadoop.fs.s3a.secret.key=changeme \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.nessie.type=nessie \
+  --conf spark.sql.catalog.nessie.uri=http://192.168.49.1:19120/api/v1 \
+  --conf spark.sql.catalog.nessie.warehouse=s3a://warehouse \
+  --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp -Divy.home=/tmp" \
+  --class ru.ibs.dar.das.bigdata.IcebergTest \
+  IcebergTest.jar
+
+real    2m50.169s
+user    0m17.112s
+sys     0m0.927s
+
+### Запускаем задание Spark по работе с S3
+/opt/spark/bin/spark-submit \
+  --master k8s://$KCP \
+  --deploy-mode cluster \
+  --packages org.apache.hadoop:hadoop-aws:3.3.4 \
+  --conf spark.executor.instances=3 \
+  --conf spark.executor.cores=1 \
+  --conf spark.executor.memory=1G \
+  --conf spark.driver.host=192.168.49.1 \
+  --conf spark.kubernetes.container.image=apache/spark:3.5.6 \
+  --conf spark.kubernetes.namespace=spark \
+  --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+  --conf spark.kubernetes.file.upload.path=s3a://tmp \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.access.key=iceberg \
+  --conf spark.hadoop.fs.s3a.secret.key=changeme \
+  --conf spark.hadoop.fs.s3a.endpoint=http://192.168.49.1:9000 \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  --conf spark.hadoop.fs.s3a.fast.upload=true \
+  --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp -Divy.home=/tmp" \
+  --class ru.ibs.dar.das.bigdata.S3Test \
+  S3Test.jar
+
+real    2m51.784s
+user    0m17.178s
+sys     0m0.849s

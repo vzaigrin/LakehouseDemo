@@ -1,0 +1,55 @@
+# Демонстрация Spark c MinIO и Iceberg
+
+## Запускаем Spark, MinIO и Iceberg
+$ docker compose up -d
+$ docker compose ps -a
+
+
+## Spark и MinIO без Iceberg
+
+### Вариант 1 - Spark packages
+$ docker exec -ti master /bin/bash
+$ /opt/spark/bin/spark-shell --master spark://master:7077 \
+	--packages org.apache.hadoop:hadoop-aws:3.3.4 \
+	--conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+	--conf spark.hadoop.fs.s3a.access.key=admin \
+	--conf spark.hadoop.fs.s3a.secret.key=password \
+	--conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+	--conf spark.hadoop.fs.s3a.path.style.access=true \
+	--conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+	--conf spark.hadoop.fs.s3a.fast.upload=true < /home/spark/script1.sc
+
+### Вариант 2 - Копируем jar файлы для работы с S3 в $SPARK_HOME/jars
+$ for i in master slave1 slave2 slave3; do docker cp jars/org.apache.hadoop_hadoop-aws-3.3.4.jar $i:/opt/spark/jars; docker cp jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar $i:/opt/spark/jars; done
+
+$ /opt/spark/bin/spark-shell --master spark://master:7077 \
+	--conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+	--conf spark.hadoop.fs.s3a.access.key=admin \
+	--conf spark.hadoop.fs.s3a.secret.key=password \
+	--conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+	--conf spark.hadoop.fs.s3a.path.style.access=true \
+	--conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+	--conf spark.hadoop.fs.s3a.fast.upload=true < /home/spark/script1.sc
+
+
+### Iceberg
+
+## Spark, MinIO и Iceberg
+
+$ docker exec -ti master /bin/bash
+/opt/spark/bin/spark-shell --master spark://master:7077 \
+	--packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1 \
+	--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+	--conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+	--conf spark.hadoop.fs.s3a.access.key=admin \
+	--conf spark.hadoop.fs.s3a.secret.key=password \
+	--conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+	--conf spark.hadoop.fs.s3a.path.style.access=true \
+	--conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+	--conf spark.hadoop.fs.s3a.fast.upload=true \
+	--conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+	--conf spark.sql.catalog.nessie.type=nessie \
+	--conf spark.sql.catalog.nessie.default-namespace=warehouse \
+	--conf spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1 \
+	--conf spark.sql.catalog.nessie.warehouse=s3a://warehouse < /home/spark/script2.sc
+

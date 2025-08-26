@@ -1,0 +1,3 @@
+CREATE ROLE nessie WITH LOGIN PASSWORD 'changeme';
+ALTER DATABASE nessiedb OWNER TO nessie;
+CREATE SCHEMA nessie AUTHORIZATION nessie;
