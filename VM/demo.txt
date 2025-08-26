@@ -151,6 +151,7 @@ cat > bin/nessie-admin.sh << EOF
 
 /usr/bin/java -jar /opt/nessie/jars/nessie-server-admin-tool.jar \$1
 EOF
+
 chmod +x bin/nessie-admin.sh
 
 bin/nessie-admin.sh info
@@ -164,6 +165,7 @@ cat > bin/nessie-cli.sh << EOF
 
 /usr/bin/java -jar /opt/nessie/jars/nessie-cli.jar
 EOF
+
 chmod +x bin/nessie-cli.sh
 
 bin/nessie-cli.sh
@@ -184,6 +186,7 @@ cat > bin/nessie-gc.sh << EOF
 
 /usr/bin/java -jar /opt/nessie/jars/nessie-gc.jar list --jdbc --jdbc-url=jdbc:postgresql://127.0.0.1:5432/nessiedb --jdbc-user nessie --jdbc-password changeme
 EOF
+
 chmod +x bin/nessie-gc.sh
 
 
@@ -211,6 +214,7 @@ sudo chmod +x /usr/local/bin/minikube
 minikube start --cpus='max' --memory='no-limit'
 kubectl cluster-info
 export KCP=$(kubectl config view -o jsonpath="{.clusters[].cluster.server}")
+echo $KCP
 
 
 ## Установка Spark локально для запуска заданий
@@ -313,3 +317,57 @@ sys     0m0.927s
 real    2m51.784s
 user    0m17.178s
 sys     0m0.849s
+
+
+## Устанавливаем и запускаем Trino
+### Устанавливаем Trino Helm
+wget https://get.helm.sh/helm-v3.18.6-linux-amd64.tar.gz
+tar xzvf helm-v3.18.6-linux-amd64.tar.gz
+sudo mv linux-amd64/helm /usr/local/bin
+sudo chown root:root /usr/local/bin/helm
+helm version
+helm repo add trino https://trinodb.github.io/charts
+
+### Устанавливаем Trino CLI
+wget https://repo1.maven.org/maven2/io/trino/trino-cli/476/trino-cli-476-executable.jar
+sudo mv trino-cli-476-executable.jar /usr/local/bin/trino
+sudo chown root:root /usr/local/bin/trino
+sudo chmod +x /usr/local/bin/trino
+trino --version
+
+### Создаём пространство имён для Trino
+kubectl create namespace trino
+
+## Создаём конфигурационный файл для Trino
+cat > trino.yaml << EOF
+server:
+  workers: 3
+coordinator:
+  jvm:
+    maxHeapSize: "8G"
+worker:
+  jvm:
+    maxHeapSize: "8G"
+fs.native-s3.enabled: true
+s3.endpoint: http://192.168.49.1:9000
+s3.aws-access-key: trino
+s3.aws-secret-key: password
+connector.name: iceberg
+iceberg.catalog.type: nessie
+iceberg.nessie-catalog.uri: http://192.168.49.1:19120/api/v1
+iceberg.nessie-catalog.default-warehouse-dir: /trino
+EOF
+
+### Устанавливаем кластер Trino
+helm install trino-cluster trino/trino -f trino.yaml -n trino
+
+### Включаем перенаправление портов
+kubectl --namespace trino port-forward svc/trino-cluster-trino 8080:8080
+
+### Подключаемся к Trino (в другом терминале)
+trino --server http://localhost:8080
+trino> select count(*) from tpch.tiny.nation;
+trino>^D
+
+### Удаляем кластер Trino
+helm uninstall trino-cluster -n trino
