@@ -320,6 +320,27 @@ sys     0m0.849s
 
 
 ## Устанавливаем и запускаем Trino
+### Создаём бакет, пользователя и политику для Trino в S3
+mc mb minio/trino
+mc admin user add minio trino password
+cat > trino.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect":"Allow",
+      "Action":["s3:*"],
+      "Resource":[
+        "arn:aws:s3:::trino"
+      ]
+    }
+  ]
+}
+EOF
+
+mc admin policy create minio trino trino.json
+mc admin policy attach minio trino --user=trino
+
 ### Устанавливаем Trino Helm
 wget https://get.helm.sh/helm-v3.18.6-linux-amd64.tar.gz
 tar xzvf helm-v3.18.6-linux-amd64.tar.gz
@@ -344,29 +365,41 @@ server:
   workers: 3
 coordinator:
   jvm:
-    maxHeapSize: "8G"
+    maxHeapSize: "16G"
 worker:
   jvm:
     maxHeapSize: "8G"
-fs.native-s3.enabled: true
-s3.endpoint: http://192.168.49.1:9000
-s3.aws-access-key: trino
-s3.aws-secret-key: password
-connector.name: iceberg
-iceberg.catalog.type: nessie
-iceberg.nessie-catalog.uri: http://192.168.49.1:19120/api/v1
-iceberg.nessie-catalog.default-warehouse-dir: /trino
+catalogs:
+  lakehouse: |-
+    connector.name=iceberg
+    iceberg.catalog.type=nessie
+    iceberg.nessie-catalog.uri=http://192.168.49.1:19120/api/v1
+    iceberg.nessie-catalog.default-warehouse-dir=s3a://warehouse
+    fs.native-s3.enabled=true
+    s3.endpoint=http://192.168.49.1:9000
+    s3.region=default
+    s3.path-style-access=true
+    s3.aws-access-key=trino
+    s3.aws-secret-key=password    
 EOF
 
-### Устанавливаем кластер Trino
+### Запускаем кластер Trino
 helm install trino-cluster trino/trino -f trino.yaml -n trino
+
+### Проверяем
+kubectl get all -n trino
 
 ### Включаем перенаправление портов
 kubectl --namespace trino port-forward svc/trino-cluster-trino 8080:8080
+curl http://localhost:8080/v1/info | jq
 
 ### Подключаемся к Trino (в другом терминале)
 trino --server http://localhost:8080
 trino> select count(*) from tpch.tiny.nation;
+trino> create schema lakehouse.test WITH (location = 's3a://trino/test/');
+trino> create table lakehouse.test.t1 (id int, name varchar)  with (location = 's3a://trino/test/t1');
+trino> insert into lakehouse.test.t1 values (1, 'One'), (2, 'Two');
+trino> select * lakehouse.test.t1;
 trino>^D
 
 ### Удаляем кластер Trino
