@@ -94,7 +94,7 @@ mkdir jars
 ### Nessie Server
 curl -L -o jars/nessie-quarkus-0.104.2-runner.jar https://github.com/projectnessie/nessie/releases/download/nessie-0.104.2/nessie-quarkus-0.104.2-runner.jar
 
-cat > config/application.properties << EOF 
+cat > config/application.properties << EOF
 quarkus.management.port=9009
 nessie.catalog.default-warehouse=warehouse
 nessie.catalog.warehouses.warehouse.location=http://minio:9000/warehouse
@@ -122,14 +122,14 @@ Type=notify
 
 WorkingDirectory=/opt/nessie
 
-User=nessie      
+User=nessie
 Group=nessie
 
-ExecStart=/usr/bin/java -jar jars/nessie-quarkus-0.104.2-runner.jar 
+ExecStart=/usr/bin/java -jar jars/nessie-quarkus-0.104.2-runner.jar
 
 # Let systemd restart this service always
 Restart=always
- 
+
 # Disable killing of MinIO by the kernel's OOM killer
 OOMScoreAdjust=-1000
 SendSIGKILL=no
@@ -210,7 +210,7 @@ curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/miniku
 sudo mv minikube /usr/local/bin/minikube
 sudo chmod +x /usr/local/bin/minikube
 
-### Запуск Minikube 
+### Запуск Minikube
 minikube start --cpus='max' --memory='no-limit'
 kubectl cluster-info
 export KCP=$(kubectl config view -o jsonpath="{.clusters[].cluster.server}")
@@ -331,7 +331,8 @@ cat > trino.json << EOF
       "Effect":"Allow",
       "Action":["s3:*"],
       "Resource":[
-        "arn:aws:s3:::trino"
+        "arn:aws:s3:::trino",
+        "arn:aws:s3:::trino/*"
       ]
     }
   ]
