@@ -381,7 +381,7 @@ catalogs:
     s3.region=default
     s3.path-style-access=true
     s3.aws-access-key=trino
-    s3.aws-secret-key=password    
+    s3.aws-secret-key=password
 EOF
 
 ### Запускаем кластер Trino
@@ -400,7 +400,11 @@ trino> select count(*) from tpch.tiny.nation;
 trino> create schema lakehouse.test WITH (location = 's3a://trino/test/');
 trino> create table lakehouse.test.t1 (id int, name varchar)  with (location = 's3a://trino/test/t1');
 trino> insert into lakehouse.test.t1 values (1, 'One'), (2, 'Two');
-trino> select * lakehouse.test.t1;
+trino> select * from lakehouse.test.t1;
+trino> update lakehouse.test.t1 set name = 'TwoTwo' where id = 2;
+trino> select * from lakehouse.test.t1;
+trino> drop table lakehouse.test.t1;
+trino> drop schema lakehouse.test;
 trino>^D
 
 ### Удаляем кластер Trino
